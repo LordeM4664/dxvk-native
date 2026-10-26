@@ -1,0 +1,64 @@
+/name: Build DXVK d3d9 (Android ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repositório da DXVK nativa (dono/nome)"
+        default: "Joshua-Ashton/dxvk-native"
+      ref:
+        description: "Tag, branch ou commit (ex: a versão baseada na 1.10.x)"
+        default: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Baixar o código-fonte
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Instalar ferramentas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build glslang-tools python3-pip
+          sudo apt-get install -y libsdl2-dev || true
+
+      - name: Instalar Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+
+      - name: Criar arquivo de cross-compile
+        run: |
+          BIN=${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin
+          cat > android.txt <<EOF
+          [binaries]
+          c = '$BIN/aarch64-linux-android29-clang'
+          cpp = '$BIN/aarch64-linux-android29-clang++'
+          ar = '$BIN/llvm-ar'
+          strip = '$BIN/llvm-strip'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+
+      - name: Configurar e compilar
+        run: |
+          meson setup build --cross-file android.txt --buildtype release -Dbuild_id=false
+          ninja -C build
+
+      - name: Listar resultado
+        run: find build -name "*.so" -ls
+
+      - name: Salvar os arquivos .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-android-arm64
+          path: build/**/*.so
