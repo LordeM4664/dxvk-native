@@ -1,4 +1,4 @@
-/name: Build DXVK d3d9 (Android ARM64)
+name: Build DXVK d3d9 (Android ARM64)
 
 on:
   workflow_dispatch:
