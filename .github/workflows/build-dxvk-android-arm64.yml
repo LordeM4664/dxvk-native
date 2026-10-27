@@ -1,0 +1,273 @@
+name: Build DXVK d3d9 (Android ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repositório do DXVK nativo (owner/name)"
+        default: "Joshua-Ashton/dxvk-native"
+      ref:
+        description: "Branch, tag ou commit"
+        default: "master"
+      abi:
+        description: "ABI Android"
+        default: "arm64-v8a"
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+
+jobs:
+  build-dxvk-native-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    env:
+      ABI: ${{ github.event.inputs.abi || 'arm64-v8a' }}
+      NDK_VERSION: r26d
+      BUILD_DIR: build
+      ARTIFACT_DIR: artifacts
+      FINAL_LIB: libdxvk_d3d9.so
+
+    steps:
+      - name: Checkout do repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo }}
+          ref: ${{ github.event.inputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Instalar dependências
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            meson \
+            pkg-config \
+            python3-pip \
+            git \
+            unzip \
+            clang \
+            lld \
+            ca-certificates
+          sudo apt-get install -y libsdl2-dev || true
+
+      - name: Instalar Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Verificar estrutura do Projeto
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Diretório atual: $PWD"
+          ls -la
+          echo "--- Arquivos relevantes ---"
+          find . -maxdepth 3 \( -name "meson.build" -o -name "CMakeLists.txt" -o -name "build.sh" -o -name "package-release.sh" -o -name "*.mk" \) | head -200
+
+      - name: Criar cross-file Android ARM64
+        if: ${{ env.ABI == 'arm64-v8a' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > android-arm64.txt <<EOF
+          [binaries]
+          c = '$BIN/aarch64-linux-android29-clang'
+          cpp = '$BIN/aarch64-linux-android29-clang++'
+          ar = '$BIN/llvm-ar'
+          strip = '$BIN/llvm-strip'
+          pkgconfig = 'pkg-config'
+
+          [properties]
+          needs_exe_wrapper = false
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          EOF
+          echo "Cross-file ARM64:"
+          cat android-arm64.txt
+
+      - name: Criar cross-file Android ARMv7
+        if: ${{ env.ABI == 'armeabi-v7a' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          cat > android-armv7.txt <<EOF
+          [binaries]
+          c = '$BIN/armv7a-linux-androideabi29-clang'
+          cpp = '$BIN/armv7a-linux-androideabi29-clang++'
+          ar = '$BIN/llvm-ar'
+          strip = '$BIN/llvm-strip'
+          pkgconfig = 'pkg-config'
+
+          [properties]
+          needs_exe_wrapper = false
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'arm'
+          cpu = 'armv7'
+          endian = 'little'
+          EOF
+          echo "Cross-file ARMv7:"
+          cat android-armv7.txt
+
+      - name: Detectar tipo de build
+        id: build_detect
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "meson.build" ]; then
+            echo "system=meson" >> "$GITHUB_OUTPUT"
+          elif [ -f "CMakeLists.txt" ]; then
+            echo "system=cmake" >> "$GITHUB_OUTPUT"
+          elif [ -f "build.sh" ] || [ -f "package-release.sh" ]; then
+            echo "system=custom" >> "$GITHUB_OUTPUT"
+          else
+            echo "system=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Sistema detectado:"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Compilar com Meson
+        if: ${{ steps.build_detect.outputs.system == 'meson' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CROSS_FILE="android-arm64.txt"
+          if [ "${ABI}" = "armeabi-v7a" ]; then
+            CROSS_FILE="android-armv7.txt"
+          fi
+
+          meson setup "${BUILD_DIR}" \
+            --cross-file "${CROSS_FILE}" \
+            --buildtype release \
+            -Ddefault_library=shared \
+            -Dcpp_std=c++17
+
+          ninja -C "${BUILD_DIR}"
+
+      - name: Compilar com CMake
+        if: ${{ steps.build_detect.outputs.system == 'cmake' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export ANDROID_NDK_HOME="${{ steps.ndk.outputs.ndk-path }}"
+          export ANDROID_NDK="${ANDROID_NDK_HOME}"
+
+          cmake -S . -B "${BUILD_DIR}" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ABI}" \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MAKE_PROGRAM=ninja
+
+          cmake --build "${BUILD_DIR}" --parallel
+
+      - name: Rodar build customizado, se existir
+        if: ${{ steps.build_detect.outputs.system == 'custom' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "package-release.sh" ]; then
+            echo "Executando package-release.sh"
+            bash ./package-release.sh
+          elif [ -f "build.sh" ]; then
+            echo "Executando build.sh"
+            bash ./build.sh
+          else
+            echo "Nenhum build.sh/package-release.sh foi encontrado."
+            exit 1
+          fi
+
+      - name: Preparar diretório de artefatos
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "${ARTIFACT_DIR}"
+
+      - name: Procurar .so gerados
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Arquivos .so encontrados:"
+          find . -type f \( -iname "*.so" -o -iname "*.so.*" \) | sort | head -500 || true
+
+      - name: Selecionar e renomear o .so alvo
+        id: pick_lib
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          FOUND=$(find . -type f \( -iname "*.so" -o -iname "*.so.*" \) 2>/dev/null | sort)
+
+          if [ -z "${FOUND}" ]; then
+            echo "Nenhum arquivo .so foi gerado pelo build."
+            echo "Isso normalmente significa que o repositório não suporta build nativo para Android ${ABI}."
+            exit 1
+          fi
+
+          CANDIDATE=""
+          while IFS= read -r f; do
+            base=$(basename "$f")
+            lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+            if [[ "$lower" == *"dxvk"* ]] && [[ "$lower" == *"d3d9"* ]]; then
+              CANDIDATE="$f"
+              break
+            fi
+          done <<< "${FOUND}"
+
+          if [ -z "$CANDIDATE" ]; then
+            while IFS= read -r f; do
+              base=$(basename "$f")
+              lower=$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')
+              if [[ "$lower" == *"dxvk"* ]] || [[ "$lower" == *"d3d9"* ]]; then
+                CANDIDATE="$f"
+                break
+              fi
+            done <<< "${FOUND}"
+          fi
+
+          if [ -z "$CANDIDATE" ]; then
+            CANDIDATE=$(printf '%s\n' "${FOUND}" | head -n 1)
+          fi
+
+          echo "Arquivo selecionado: ${CANDIDATE}"
+          cp -f "${CANDIDATE}" "${ARTIFACT_DIR}/${FINAL_LIB}"
+
+          echo "Lista final do artefato:"
+          ls -l "${ARTIFACT_DIR}"
+          file "${ARTIFACT_DIR}/${FINAL_LIB}" || true
+
+          echo "selected=${CANDIDATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Validar artefato final
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -f "${ARTIFACT_DIR}/${FINAL_LIB}" ]; then
+            echo "Erro: o arquivo final ${FINAL_LIB} não foi gerado."
+            exit 1
+          fi
+          ls -l "${ARTIFACT_DIR}/${FINAL_LIB}"
+          file "${ARTIFACT_DIR}/${FINAL_LIB}" || true
+
+      - name: Upload do artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: libdxvk_d3d9-android-${{ env.ABI }}
+          path: ${{ env.ARTIFACT_DIR }}/${{ env.FINAL_LIB }}
